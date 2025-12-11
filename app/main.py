@@ -16,6 +16,23 @@ from app.services.embedding_service import EmbeddingService
 from app.services.vector_service import VectorService
 from app.services.rag_service import RAGService
 from app.services.sql_service import TextToSQLService
+from app.services.router_service import QueryRouter
+from app.utils import (
+    FileValidator, QueryValidator, ValidationError,
+    ErrorResponse, format_file_size, truncate_text
+)
+
+# OPIK monitoring (optional - gracefully handles if not configured)
+try:
+    from opik import track
+    OPIK_AVAILABLE = True
+except ImportError:
+    OPIK_AVAILABLE = False
+    # Create a no-op decorator if OPIK is not installed
+    def track(name=None, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
 
 app = FastAPI(
     title="Multi-Source RAG + Text-to-SQL API",
@@ -39,16 +56,42 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 @app.get("/health", status_code=status.HTTP_200_OK, tags=["Health"])
 async def health_check():
     """
-    Health check endpoint to verify the API is running.
+    Health check endpoint to verify the API is running and check service connectivity.
 
     Returns:
-        dict: Status information including timestamp and service state
+        dict: Status information including timestamp, service state, and connectivity checks
     """
+    global embedding_service, vector_service, rag_service, sql_service
+
+    # Check service availability
+    services_status = {
+        "embedding_service": embedding_service is not None,
+        "vector_service": vector_service is not None,
+        "rag_service": rag_service is not None,
+        "sql_service": sql_service is not None,
+    }
+
+    # Determine overall health
+    any_service_available = any(services_status.values())
+    health_status = "healthy" if any_service_available else "degraded"
+
     return {
-        "status": "healthy",
+        "status": health_status,
         "service": "Multi-Source RAG + Text-to-SQL API",
         "timestamp": datetime.utcnow().isoformat(),
         "version": "0.1.0",
+        "services": services_status,
+        "features_available": {
+            "document_rag": services_status["rag_service"],
+            "text_to_sql": services_status["sql_service"],
+            "query_routing": True,  # Always available (keyword-based)
+        },
+        "configuration": {
+            "openai_configured": settings.OPENAI_API_KEY is not None,
+            "pinecone_configured": settings.PINECONE_API_KEY is not None,
+            "database_configured": settings.DATABASE_URL is not None,
+            "opik_configured": settings.OPIK_API_KEY is not None if hasattr(settings, 'OPIK_API_KEY') else False,
+        }
     }
 
 
@@ -69,8 +112,16 @@ async def get_info():
         "features": {
             "document_rag": "Available - Phase 1 Complete",
             "text_to_sql": "Available - Phase 2 Complete",
-            "query_routing": "Pending implementation - Phase 3",
-            "evaluation": "Pending implementation - Phase 4",
+            "query_routing": "Available - Phase 3 Complete",
+            "evaluation_monitoring": "Available - Phase 4 Complete",
+            "polish_documentation": "Available - Phase 5 Complete",
+            "docker_deployment": "Available - Phase 6 Complete",
+        },
+        "deployment": {
+            "docker": "Ready - Use docker-compose up",
+            "dockerfile": "Multi-stage build optimized",
+            "health_checks": "Enabled",
+            "volumes": ["uploads", "vanna_chromadb"]
         },
         "system": {
             "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
@@ -78,10 +129,12 @@ async def get_info():
         "endpoints": {
             "docs": "/docs",
             "redoc": "/redoc",
-            "health": "/health",
+            "health": "/health (enhanced with service checks)",
             "info": "/info",
-            "upload_document": "POST /upload",
-            "query_documents": "POST /query/documents",
+            "stats": "/stats (system statistics)",
+            "unified_query": "POST /query (recommended - intelligent routing)",
+            "upload_document": "POST /upload (with validation)",
+            "query_documents": "POST /query/documents (with validation)",
             "list_documents": "GET /documents",
             "generate_sql": "POST /query/sql/generate",
             "execute_sql": "POST /query/sql/execute",
@@ -109,24 +162,40 @@ async def root():
 
 
 @app.post("/upload", status_code=status.HTTP_201_CREATED, tags=["Documents"])
+@track(name="upload_document")
 async def upload_document(file: UploadFile = File(...)):
     """
-    Upload and process a document (PDF, DOCX, CSV, JSON).
-    Pipeline: save → parse → chunk → embed → store in Pinecone
+    Upload and process a document (PDF, DOCX, CSV, JSON, TXT).
+    Pipeline: validate → save → parse → chunk → embed → store in Pinecone
 
     Args:
-        file: The document file to upload
+        file: The document file to upload (max 50 MB)
 
     Returns:
         dict: Upload status with filename and chunks created
+
+    Raises:
+        HTTPException: If validation fails or services unavailable
     """
     global embedding_service, vector_service
+
+    # Validate file
+    try:
+        FileValidator.validate_file(file)
+    except ValidationError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=ErrorResponse.validation_error(str(e), field="file")
+        )
 
     # Check if services are initialized
     if not embedding_service or not vector_service:
         raise HTTPException(
             status_code=503,
-            detail="Services not initialized. Please configure API keys in .env file."
+            detail=ErrorResponse.service_unavailable(
+                "Document RAG services",
+                "Please configure OPENAI_API_KEY and PINECONE_API_KEY in .env"
+            )
         )
 
     try:
@@ -157,39 +226,67 @@ async def upload_document(file: UploadFile = File(...)):
             namespace="default"
         )
 
+        file_size = file_path.stat().st_size
+
         return {
             "status": "success",
             "filename": file.filename,
-            "file_size_bytes": file_path.stat().st_size,
+            "file_size": format_file_size(file_size),
+            "file_size_bytes": file_size,
             "chunks_created": len(chunks),
             "total_tokens": sum(chunk['token_count'] for chunk in chunks),
             "message": f"Document processed and {len(chunks)} chunks stored in Pinecone"
         }
 
+    except ValidationError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=ErrorResponse.validation_error(str(e))
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=ErrorResponse.internal_error("upload document", e)
+        )
 
 
 @app.post("/query/documents", status_code=status.HTTP_200_OK, tags=["Query"])
+@track(name="query_documents")
 async def query_documents(question: str, top_k: int = 3):
     """
     Query documents using RAG (Retrieval-Augmented Generation).
     Retrieves relevant chunks and generates an answer using GPT-4.
 
     Args:
-        question: The question to answer
-        top_k: Number of document chunks to retrieve (default: 3)
+        question: The question to answer (3-1000 characters)
+        top_k: Number of document chunks to retrieve (1-10, default: 3)
 
     Returns:
         dict: Generated answer with sources and metadata
+
+    Raises:
+        HTTPException: If validation fails or service unavailable
     """
     global rag_service
+
+    # Validate inputs
+    try:
+        question = QueryValidator.validate_question(question)
+        top_k = QueryValidator.validate_top_k(top_k)
+    except ValidationError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=ErrorResponse.validation_error(str(e))
+        )
 
     # Check if service is initialized
     if not rag_service:
         raise HTTPException(
             status_code=503,
-            detail="RAG service not initialized. Please configure API keys in .env file."
+            detail=ErrorResponse.service_unavailable(
+                "RAG service",
+                "Please configure OPENAI_API_KEY and PINECONE_API_KEY in .env"
+            )
         )
 
     try:
@@ -203,7 +300,10 @@ async def query_documents(question: str, top_k: int = 3):
         return result
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=ErrorResponse.internal_error("query documents", e)
+        )
 
 
 @app.get("/documents", status_code=status.HTTP_200_OK, tags=["Documents"])
@@ -233,7 +333,216 @@ async def list_documents():
         raise HTTPException(status_code=500, detail=f"Failed to list documents: {str(e)}")
 
 
+@app.get("/stats", status_code=status.HTTP_200_OK, tags=["Information"])
+async def get_stats():
+    """
+    Get system statistics and usage information.
+
+    Returns:
+        dict: Statistics including document count, total size, and service status
+    """
+    global sql_service
+
+    try:
+        # Count uploaded documents
+        documents = []
+        total_size = 0
+
+        for file_path in UPLOAD_DIR.iterdir():
+            if file_path.is_file() and not file_path.name.startswith('.'):
+                file_size = file_path.stat().st_size
+                documents.append({
+                    "filename": file_path.name,
+                    "size_bytes": file_size,
+                })
+                total_size += file_size
+
+        # Get pending SQL queries count
+        pending_sql_count = 0
+        if sql_service:
+            try:
+                pending_sql_count = len(sql_service.get_pending_queries())
+            except Exception:
+                pass
+
+        return {
+            "documents": {
+                "total_uploaded": len(documents),
+                "total_size": format_file_size(total_size),
+                "total_size_bytes": total_size,
+            },
+            "sql": {
+                "pending_queries": pending_sql_count,
+                "service_available": sql_service is not None,
+            },
+            "system": {
+                "uptime_checked_at": datetime.utcnow().isoformat(),
+                "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            },
+            "configuration": {
+                "chunk_size": settings.CHUNK_SIZE,
+                "chunk_overlap": settings.CHUNK_OVERLAP,
+                "max_file_size": format_file_size(FileValidator.MAX_FILE_SIZE),
+            }
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=ErrorResponse.internal_error("get statistics", e)
+        )
+
+
+@app.post("/query", status_code=status.HTTP_200_OK, tags=["Query"])
+@track(name="unified_query")
+async def unified_query(question: str, auto_approve_sql: bool = False, top_k: int = 3):
+    """
+    Unified query endpoint with intelligent routing.
+    Automatically routes queries to SQL, Documents, or both (HYBRID) based on intent.
+
+    Args:
+        question: The natural language question
+        auto_approve_sql: If True, automatically execute SQL queries without approval (testing only)
+        top_k: Number of document chunks to retrieve for RAG (default: 3)
+
+    Returns:
+        dict: Query results with routing information and answers
+    """
+    global rag_service, sql_service
+
+    try:
+        # Determine routing using QueryRouter
+        route_type = QueryRouter.route(question)
+
+        result = {
+            "question": question,
+            "route": route_type,
+            "routing_explanation": QueryRouter.explain_routing(question)
+        }
+
+        # Route to SQL
+        if route_type == "SQL":
+            if not sql_service:
+                raise HTTPException(
+                    status_code=503,
+                    detail="SQL service not initialized. Please configure DATABASE_URL in .env file."
+                )
+
+            # Generate SQL
+            sql_result = sql_service.generate_sql_for_approval(question)
+
+            if auto_approve_sql:
+                # Auto-execute for testing
+                execution_result = sql_service.execute_approved_query(
+                    sql_result['query_id'],
+                    approved=True
+                )
+                result.update({
+                    "sql": execution_result['sql'],
+                    "results": execution_result['results'],
+                    "result_count": execution_result['result_count'],
+                    "status": "executed",
+                    "note": "SQL auto-executed (testing mode)"
+                })
+            else:
+                # Return for approval
+                result.update({
+                    "query_id": sql_result['query_id'],
+                    "sql": sql_result['sql'],
+                    "explanation": sql_result['explanation'],
+                    "status": "pending_approval",
+                    "note": "Use POST /query/sql/execute with this query_id to execute"
+                })
+
+        # Route to Documents
+        elif route_type == "DOCUMENTS":
+            if not rag_service:
+                raise HTTPException(
+                    status_code=503,
+                    detail="RAG service not initialized. Please configure API keys in .env file."
+                )
+
+            rag_result = await rag_service.generate_answer(
+                question=question,
+                top_k=top_k,
+                namespace="default",
+                include_sources=True
+            )
+
+            result.update({
+                "answer": rag_result['answer'],
+                "sources": rag_result.get('sources', []),
+                "chunks_used": rag_result.get('chunks_used', 0),
+                "status": "completed"
+            })
+
+        # Route to HYBRID (both SQL and Documents)
+        elif route_type == "HYBRID":
+            # Check both services are available
+            if not sql_service or not rag_service:
+                missing_services = []
+                if not sql_service:
+                    missing_services.append("SQL service")
+                if not rag_service:
+                    missing_services.append("RAG service")
+
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"HYBRID query requires both services. Missing: {', '.join(missing_services)}"
+                )
+
+            # Get SQL results
+            sql_result = sql_service.generate_sql_for_approval(question)
+
+            if auto_approve_sql:
+                execution_result = sql_service.execute_approved_query(
+                    sql_result['query_id'],
+                    approved=True
+                )
+                sql_data = {
+                    "sql": execution_result['sql'],
+                    "results": execution_result['results'],
+                    "result_count": execution_result['result_count'],
+                    "status": "executed"
+                }
+            else:
+                sql_data = {
+                    "query_id": sql_result['query_id'],
+                    "sql": sql_result['sql'],
+                    "explanation": sql_result['explanation'],
+                    "status": "pending_approval"
+                }
+
+            # Get document context
+            rag_result = await rag_service.generate_answer(
+                question=question,
+                top_k=top_k,
+                namespace="default",
+                include_sources=True
+            )
+
+            # Combine both results
+            result.update({
+                "sql_component": sql_data,
+                "document_component": {
+                    "answer": rag_result['answer'],
+                    "sources": rag_result.get('sources', []),
+                    "chunks_used": rag_result.get('chunks_used', 0)
+                },
+                "status": "completed" if auto_approve_sql else "partial_pending_sql_approval",
+                "note": "HYBRID query combines both SQL data and document context"
+            })
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unified query failed: {str(e)}")
+
+
 @app.post("/query/sql/generate", status_code=status.HTTP_200_OK, tags=["SQL"])
+@track(name="generate_sql")
 async def generate_sql(question: str):
     """
     Generate SQL from a natural language question using Vanna.ai.
@@ -262,6 +571,7 @@ async def generate_sql(question: str):
 
 
 @app.post("/query/sql/execute", status_code=status.HTTP_200_OK, tags=["SQL"])
+@track(name="execute_sql")
 async def execute_sql(query_id: str, approved: bool = True):
     """
     Execute a previously generated SQL query after user approval.
@@ -334,7 +644,29 @@ async def startup_event():
     print("Phase 0: Foundation Setup - COMPLETE")
     print("Phase 1: Document RAG MVP - COMPLETE")
     print("Phase 2: Text-to-SQL Foundation - COMPLETE")
+    print("Phase 3: Query Routing - COMPLETE")
+    print("Phase 4: Evaluation & Monitoring - COMPLETE")
+    print("Phase 5: Polish & Documentation - COMPLETE")
+    print("Phase 6: Docker Deployment - COMPLETE")
     print("=" * 60)
+    print("ALL PHASES COMPLETE - PRODUCTION READY!")
+    print("=" * 60)
+
+    # Initialize OPIK monitoring if available
+    if OPIK_AVAILABLE:
+        try:
+            if settings.OPIK_API_KEY:
+                print("\nInitializing OPIK monitoring...")
+                from opik import configure
+                configure(api_key=settings.OPIK_API_KEY)
+                print("✓ OPIK monitoring initialized!")
+            else:
+                print("\nOPIK available but API key not configured.")
+                print("Monitoring will use local tracking only.")
+        except Exception as e:
+            print(f"\nWARNING: Failed to initialize OPIK: {e}")
+    else:
+        print("\nOPIK not available (package not installed).")
 
     # Initialize Document RAG services if API keys are available
     try:
