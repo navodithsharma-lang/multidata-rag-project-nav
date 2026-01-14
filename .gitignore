@@ -43,6 +43,10 @@ env/
 data/uploads/*
 !data/uploads/.gitkeep
 
+# Cache directory (ignore cached files but keep structure)
+data/cached_chunks/*
+!data/cached_chunks/.gitkeep
+
 # Vanna ChromaDB storage
 data/vanna_chromadb/
 

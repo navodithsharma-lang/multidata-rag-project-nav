@@ -6,6 +6,7 @@ python-multipart
 
 # Document Processing
 unstructured[all-docs]
+pdfminer.six==20231228  # Pin compatible version for unstructured
 python-magic  # For file type detection (uses system libmagic on macOS)
 pillow  # Image processing for document parsing
 
@@ -28,6 +29,9 @@ opik
 # Utilities
 python-dotenv
 httpx
+
+# Caching
+numpy  # Efficient binary storage of embeddings
 
 # Development
 pytest
