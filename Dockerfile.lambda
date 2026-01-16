@@ -1,5 +1,10 @@
 FROM public.ecr.aws/lambda/python:3.12
 
+# Cross-Platform Build Support:
+# - For ARM64 (recommended): docker build --platform linux/arm64 ...
+# - For x86_64: docker build --platform linux/amd64 ...
+# See CROSS_PLATFORM_BUILD.md for detailed instructions
+
 # Install system dependencies
 # Note: tesseract removed for Lambda - OCR can be added via Lambda layers
 # To add tesseract:
@@ -20,6 +25,11 @@ RUN pip install mangum
 # Copy application code
 COPY app/ ${LAMBDA_TASK_ROOT}/app/
 COPY lambda_handler.py ${LAMBDA_TASK_ROOT}/
+
+# Fix file permissions for Lambda runtime
+RUN chmod -R 755 ${LAMBDA_TASK_ROOT}/app && \
+    chmod 644 ${LAMBDA_TASK_ROOT}/lambda_handler.py && \
+    find ${LAMBDA_TASK_ROOT}/app -type f -name "*.py" -exec chmod 644 {} \;
 
 # Set Lambda handler
 CMD ["lambda_handler.handler"]

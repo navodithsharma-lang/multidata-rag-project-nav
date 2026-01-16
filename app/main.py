@@ -781,10 +781,8 @@ async def list_pending_sql_queries():
         raise HTTPException(status_code=500, detail=f"Failed to list pending queries: {str(e)}")
 
 
-# Event handlers for startup/shutdown
-@app.on_event("startup")
-async def startup_event():
-    """Execute tasks on application startup."""
+def initialize_services():
+    """Initialize all services. Called directly on Lambda startup or via FastAPI startup event."""
     global embedding_service, vector_service, rag_service, sql_service, cache_service
 
     # Ensure upload and cache directories exist
@@ -863,8 +861,15 @@ async def startup_event():
         logger.warning("Document uploads will work but caching will be unavailable.")
 
     logger.info("=" * 60)
-    logger.info("API is ready! Visit http://localhost:8000/docs")
+    logger.info("API is ready!")
     logger.info("=" * 60)
+
+
+# Event handlers for startup/shutdown
+@app.on_event("startup")
+async def startup_event():
+    """Execute tasks on application startup."""
+    initialize_services()
 
 
 @app.on_event("shutdown")

@@ -9,5 +9,11 @@ os.makedirs("/tmp/cached_chunks", exist_ok=True)
 # Import app after directory creation
 from app.main import app
 
+# Initialize services before creating handler (since lifespan="off")
+# This runs once when Lambda container starts
+from app.main import initialize_services
+initialize_services()
+
 # Lambda handler
-handler = Mangum(app, lifespan="off")
+# API Gateway HTTP API (v2 payload format)
+handler = Mangum(app, lifespan="off", api_gateway_base_path="/prod")
